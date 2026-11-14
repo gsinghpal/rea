@@ -1,7 +1,8 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   inspectRecordedCrashInputSchema,
   recordedCrashSchema,
+  type RecordedCrash,
 } from "./recordedCrash.js";
 import {
   recordedCrashFixture,
@@ -115,13 +116,11 @@ it.each([
       threads: [
         {
           ...v.threads[0],
-          registers: [
-            {
-              name: "rdi",
-              value: 9007199254740992,
-              location: { offset: "0x104", bytes: "0x8" },
-            },
-          ],
+          registers: v.threads[0]!.registers.map((register) =>
+            register.name === "rdi"
+              ? { ...register, value: 9007199254740992 }
+              : register,
+          ),
         },
       ],
     }),
@@ -147,13 +146,11 @@ it.each([
       threads: [
         {
           ...v.threads[0],
-          registers: [
-            {
-              name: "rdi",
-              value: "0x0",
-              location: { offset: "0x1e4", bytes: "0x8" },
-            },
-          ],
+          registers: v.threads[0]!.registers.map((register) =>
+            register.name === "rdi"
+              ? { ...register, location: { offset: "0x1e4", bytes: "0x8" } }
+              : register,
+          ),
         },
       ],
     }),
@@ -192,11 +189,24 @@ it.each([
       })),
     }),
   ],
-] as const)("rejects %s before Evidence serialization", (_name, change) =>
-  expect(
-    recordedCrashSchema.safeParse(change(recordedCrashFixture())).success,
-  ).toBe(false),
-);
+] as const)("rejects %s before Evidence serialization", (name, change) => {
+  const result = recordedCrashSchema.safeParse(change(recordedCrashFixture()));
+  expect(result.success).toBe(false);
+  if (result.success) throw new Error("Expected invalid recorded crash");
+  if (name === "register outside descriptor")
+    expect(result.error.issues).toContainEqual(
+      expect.objectContaining({
+        message: "Register source exceeds its descriptor.",
+      }),
+    );
+  if (name === "unsafe register number")
+    expect(result.error.issues).toContainEqual(
+      expect.objectContaining({
+        code: "invalid_type",
+        path: ["threads", 0, "registers", 14, "value"],
+      }),
+    );
+});
 
 it("does not interpret a signal through a mislabeled raw owner ABI", () => {
   const value = recordedCrashFixture();
@@ -207,6 +217,7 @@ it("does not interpret a signal through a mislabeled raw owner ABI", () => {
       notes: value.notes.map((note) => ({
         ...note,
         type: "NT_SIGINFO",
+        type_id: 0x53494749,
         owner_bytes_base64: Buffer.from("EVIL\0").toString("base64"),
       })),
       signals: [
@@ -281,4 +292,96 @@ it("keeps absent map flags unknown and validates reported permission bits", () =
       },
     }).success,
   ).toBe(false);
+});
+
+describe("recorded AArch64 core profile", () => {
+  it("accepts the complete AArch64 register window in ABI order", () => {
+    const value = recordedCrashSchema.parse(
+      recordedCrashFixture("/selected/aarch64.core", "aarch64-little-endian"),
+    );
+    expect(value.architecture).toBe("aarch64-little-endian");
+    const registers = value.threads[0]?.registers ?? [];
+    expect(registers.map(({ name }) => name)).toEqual([
+      ...Array.from({ length: 31 }, (_, index) => `x${String(index)}`),
+      "sp",
+      "pc",
+      "pstate",
+    ]);
+    expect(registers[14]?.value).toBe("0x1122334455667788");
+    expect(registers.every(({ location }) => location.bytes === "0x8")).toBe(
+      true,
+    );
+  });
+
+  it("keeps the AArch64 note ranges inside their recorded segment", () => {
+    const value = recordedCrashSchema.parse(
+      recordedCrashSignalFixture(undefined, "aarch64-little-endian"),
+    );
+    const note = value.notes[0];
+    const segment = value.segments[0];
+    if (note === undefined || segment === undefined)
+      throw new Error("Expected recorded notes");
+    expect(
+      BigInt(note.location.offset) + BigInt(note.location.bytes),
+    ).toBeLessThanOrEqual(BigInt(segment.offset) + BigInt(segment.file_size));
+    expect(value.signals[0]?.fault_address).toBe("0x1122334455667788");
+  });
+
+  it.each([
+    [
+      "an amd64 register name inside an AArch64 window",
+      (v: RecordedCrash) => ({
+        ...v,
+        threads: v.threads.map((thread) => ({
+          ...thread,
+          registers: thread.registers.map((register, index) =>
+            index === 0 ? { ...register, name: "rax" } : register,
+          ),
+        })),
+      }),
+    ],
+    [
+      "the amd64 register count",
+      (v: RecordedCrash) => ({
+        ...v,
+        threads: v.threads.map((thread) => ({
+          ...thread,
+          registers: thread.registers.slice(0, 27),
+        })),
+      }),
+    ],
+    [
+      "a 4-byte AArch64 register source",
+      (v: RecordedCrash) => ({
+        ...v,
+        threads: v.threads.map((thread) => ({
+          ...thread,
+          registers: thread.registers.map((register, index) =>
+            index === 0
+              ? {
+                  ...register,
+                  location: { ...register.location, bytes: "0x4" },
+                }
+              : register,
+          ),
+        })),
+      }),
+    ],
+  ] as const)("rejects %s", (_name, change) => {
+    const value = recordedCrashFixture(
+      "/selected/aarch64.core",
+      "aarch64-little-endian",
+    );
+    expect(recordedCrashSchema.safeParse(change(value)).success).toBe(false);
+  });
+
+  it("rejects an architecture outside the interpreted profiles", () => {
+    const value = recordedCrashFixture();
+    expect(
+      recordedCrashSchema.safeParse({
+        ...value,
+        architecture: "arm-little-endian",
+      }).success,
+    ).toBe(false);
+  });
 });

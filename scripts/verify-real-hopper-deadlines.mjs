@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, realpath, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { firstProcedureAddress } from "../dist/application/RealHopperAssertions.js";
+import { firstProcedureAddress } from "./lib/real-hopper-assertions.mjs";
+import { HopperDeadlineCleanup } from "./lib/hopper-deadline-cleanup.mjs";
 import { parseBinaryTarget } from "../dist/application/BinaryTargetResolver.js";
+import { ArtifactResourceScope } from "../dist/artifacts/ArtifactResourceScope.js";
+import { AnalysisCleanupLease } from "../dist/artifacts/AnalysisCleanupLease.js";
 import { resolveHopperAnalysisProfile } from "../dist/hopper/HopperAnalysisProfile.js";
 import { HopperApplicationLauncher } from "../dist/hopper/BridgeLauncher.js";
 import { HopperClient } from "../dist/hopper/HopperClient.js";
-import { HOPPER_PROVIDER_IDENTITY } from "../dist/hopper/HopperProviderCapabilities.js";
+import { HOPPER_PROVIDER_IDENTITY } from "../dist/hopper/HopperProviderMetadata.js";
 import { loadRealHopperFixtureTargets } from "./lib/real-hopper-fixture.mjs";
 
 // These options belong to the native client, below the CLI/MCP tool surface.
@@ -26,8 +29,20 @@ const root = await realpath(
   await mkdtemp(join(tmpdir(), "rea-hopper-deadlines-")),
 );
 const target = join(root, "deadline-fixture");
+const profileResources = new ArtifactResourceScope();
+const cleanupOwner = new HopperDeadlineCleanup(root, profileResources);
+const profileResourceScope = {
+  retain: (owner, resource) =>
+    profileResources.retain({
+      kind: "lease",
+      resource,
+      lease: AnalysisCleanupLease.forCloseOwner(owner, resource),
+    }),
+  run: (operation) => profileResources.run(operation),
+};
 let client;
 let primaryFailure;
+let operationFailed = false;
 try {
   await copyFile(fixtures.primary.path, target);
   const parsed = await parseBinaryTarget(target);
@@ -39,6 +54,7 @@ try {
     launcherPath,
     loaderArgsOverride: [],
     provider: HOPPER_PROVIDER_IDENTITY,
+    resourceScope: profileResourceScope,
   });
   if (!resolved.ok) throw resolved.error;
   const profile = resolved.value.profile;
@@ -135,18 +151,19 @@ try {
     ),
   );
 } catch (cause) {
+  operationFailed = true;
   primaryFailure = cause;
   throw cause;
 } finally {
-  if (client !== undefined) {
-    const closed = await client.close();
-    if (!closed.ok)
-      throw primaryFailure === undefined
-        ? closed.error
-        : new AggregateError(
-            [primaryFailure, closed.error],
-            "Hopper verification and cleanup failed",
-          );
+  try {
+    if (client !== undefined) cleanupOwner.setClient(client);
+    await cleanupOwner.close();
+  } catch (cleanupFailure) {
+    throw operationFailed
+      ? new AggregateError(
+          [primaryFailure, cleanupFailure],
+          "Hopper verification and cleanup failed",
+        )
+      : cleanupFailure;
   }
-  await rm(root, { recursive: true, force: true });
 }

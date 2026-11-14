@@ -1,13 +1,19 @@
 import { access } from "node:fs/promises";
 
-import { expect, it, onTestFinished, vi } from "vitest";
+import { expect, it, onTestFinished } from "vitest";
 
 import { HopperTimeoutError } from "../../../../src/domain/hopperErrors.js";
-import {
-  HopperClient,
-  HOPPER_PROCESS_DIAGNOSTIC_BYTES,
-} from "../../../../src/hopper/HopperClient.js";
+import { HopperClient } from "../../../../src/hopper/HopperClient.js";
 import { HopperFixtureLauncher } from "./hopperClient.fixture.js";
+import { waitFor } from "../../../support/testWait.js";
+
+const HOPPER_PROCESS_DIAGNOSTIC_BYTES = 8 * 1024 * 1024;
+
+const expectStoppedLauncher = (launcher: HopperFixtureLauncher): void => {
+  const child = launcher.processes[0];
+  if (child === undefined) throw new Error("Diagnostic fixture did not launch");
+  expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+};
 
 it("bounds long-lived launcher output while keeping the bridge usable", async () => {
   let observedStderrBytes = 0;
@@ -26,7 +32,7 @@ it("bounds long-lived launcher output while keeping the bridge usable", async ()
   await expect(client.start()).resolves.toMatchObject({ ok: true });
   const session = await client.callTool("echo", { value: "still usable" });
   expect(session).toEqual({ ok: true, value: { value: "still usable" } });
-  await vi.waitFor(() => {
+  await waitFor(() => {
     expect(observedStderrBytes).toBeGreaterThan(
       HOPPER_PROCESS_DIAGNOSTIC_BYTES,
     );
@@ -35,7 +41,7 @@ it("bounds long-lived launcher output while keeping the bridge usable", async ()
   await client.close();
   const directory = diagnosticLauncher.directories[0] ?? "";
   await expect(access(directory)).rejects.toMatchObject({ code: "ENOENT" });
-  expect(diagnosticLauncher.processes[0]?.exitCode).not.toBeNull();
+  expectStoppedLauncher(diagnosticLauncher);
 });
 
 it("reports observed and retained output when capture cuts a token", async () => {
@@ -84,5 +90,5 @@ it("reports observed and retained output when capture cuts a token", async () =>
   await client.close();
   const directory = diagnosticLauncher.directories[0] ?? "";
   await expect(access(directory)).rejects.toMatchObject({ code: "ENOENT" });
-  expect(diagnosticLauncher.processes[0]?.exitCode).not.toBeNull();
+  expectStoppedLauncher(diagnosticLauncher);
 });

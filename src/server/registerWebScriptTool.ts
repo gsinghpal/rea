@@ -8,6 +8,8 @@ import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { deliverEvidenceResult } from "./contractToolHandler.js";
 
 /** Register local script export without requiring a live browser provider. */
 export const registerWebScriptTool = (
@@ -15,6 +17,7 @@ export const registerWebScriptTool = (
   options: {
     readonly logger: Logger;
     readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+    readonly artifactResources: ArtifactResourceScope;
     readonly withAdmittedAnalysis?: WithAdmittedAnalysis;
   },
 ): void => {
@@ -33,17 +36,15 @@ export const registerWebScriptTool = (
             options.logger,
             contract.name,
             () =>
-              exportWebScriptsValidated(input, {
+              exportWebScriptsValidated(input, options.artifactResources, {
                 signal: context.mcpReq.signal,
               }),
           );
-          if (!result.ok)
-            return server.delivery.toCallToolResult(result, contract);
-          const recorded = options.recordEvidence?.(result.value);
-          return server.delivery.toEvidenceToolResult(
-            result.value,
+          return deliverEvidenceResult(
+            server,
+            result,
             contract,
-            recorded,
+            options.recordEvidence,
           );
         },
       ),

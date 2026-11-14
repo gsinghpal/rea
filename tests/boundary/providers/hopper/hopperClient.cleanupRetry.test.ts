@@ -107,7 +107,7 @@ const failedStartup = async (launcher: RetryCleanupLauncher) => {
     error: {
       _tag: "ProviderAdapterError",
       cleanupIncomplete: true,
-      cause: { _tag: "HopperTimeoutError" },
+      cause: { cause: { _tag: "HopperTimeoutError" } },
     },
   });
   const session = launcher.sessions[0];
@@ -160,57 +160,88 @@ it("retains failed startup cleanup until an owned process and its backing image 
   });
 });
 
-it("keeps an unconfirmed external document visible across sequential closes", async () => {
-  const launcher = new RetryCleanupLauncher(true);
-  const runtimeRoot = await PrivateRuntimeRoot.create();
-  onTestFinished(() => runtimeRoot.close());
-  const launched = await launcher.launch({
-    directory: runtimeRoot.path,
-    socketPath: join(runtimeRoot.path, "bridge.sock"),
-    token: "fixture-token",
-    runId: "fixture-run",
-  });
-  if (!launched.ok) throw launched.error;
-  const child = launched.value.process;
-  const supervisor = new ProviderProcessSupervisor(launched.value);
-  onTestFinished(() => supervisor.dispose());
-  const resources: HopperOwnedResources = {
-    launch: launched.value,
-    processSupervisor: supervisor,
-    runtimeRoot,
-    shutdownConfirmed: false,
-  };
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    await expect(
-      cleanupHopperSession({
-        socket: undefined,
-        resources,
-        activeRequest: null,
-        retainDocument: false,
-        progress: undefined,
-        logger: silentLogger,
-        onDiagnostic: undefined,
-        request: () => Promise.resolve(ok(null)),
-        releaseTransport: (socket) => socket?.destroy(),
-      }),
-    ).resolves.toMatchObject({
-      ok: false,
-      error: { cleanupResources: ["hopper-document", runtimeRoot.path] },
+it.each([false, true])(
+  "keeps an unconfirmed external document across closes when helper ownership is %s",
+  async (ownsHelper) => {
+    const launcher = new RetryCleanupLauncher(true);
+    const runtimeRoot = await PrivateRuntimeRoot.create();
+    onTestFinished(() => runtimeRoot.close());
+    const launched = await launcher.launch({
+      directory: runtimeRoot.path,
+      socketPath: join(runtimeRoot.path, "bridge.sock"),
+      token: "fixture-token",
+      runId: "fixture-run",
     });
-  }
-  expect(child.exitCode).toBeNull();
-  expect(child.signalCode).toBeNull();
-  await expect(
-    access(join(runtimeRoot.path, "image.macho")),
-  ).resolves.toBeUndefined();
-});
+    if (!launched.ok) throw launched.error;
+    const child = launched.value.process;
+    const launch: BridgeLaunch = ownsHelper
+      ? { ...launched.value, ownsProcessLifetime: true }
+      : launched.value;
+    const supervisor = new ProviderProcessSupervisor(launch);
+    onTestFinished(() => supervisor.dispose());
+    const resources: HopperOwnedResources = {
+      launch,
+      processSupervisor: supervisor,
+      runtimeRoot,
+      shutdownConfirmed: false,
+      externalApplication: undefined,
+    };
+    const socket = new Socket();
+    onTestFinished(() => {
+      socket.destroy();
+    });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(
+        cleanupHopperSession({
+          socket: attempt === 0 ? socket : undefined,
+          resources,
+          activeRequest: null,
+          retainDocument: false,
+          progress: undefined,
+          logger: silentLogger,
+          onDiagnostic: undefined,
+          request: () =>
+            Promise.resolve(
+              ok({
+                shutdown: true,
+                analysis_stopped: true,
+                document_closed: false,
+              }),
+            ),
+          releaseTransport: (socket) => socket?.destroy(),
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        error: { cleanupResources: ["hopper-document", runtimeRoot.path] },
+      });
+    }
+    if (ownsHelper)
+      expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    else {
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBeNull();
+    }
+    await expect(
+      access(join(runtimeRoot.path, "image.macho")),
+    ).resolves.toBeUndefined();
+  },
+);
 
 it("blocks a fresh launch while cleanup remains unverified", async () => {
   const launcher = new RetryCleanupLauncher();
   const { client, child } = await failedStartup(launcher);
+  expect(client.operationHealth()).toMatchObject({ state: "not_started" });
   await expect(client.start()).resolves.toMatchObject({
     ok: false,
-    error: { _tag: "HopperProtocolError" },
+    error: {
+      cleanupIncomplete: true,
+      cause: { cause: { _tag: "HopperTimeoutError" } },
+      diagnostics: { primary_error: { code: "provider_timeout" } },
+    },
+  });
+  expect(client.operationHealth()).toMatchObject({
+    state: "not_started",
+    stage: "launch",
   });
   expect(launcher.processes).toEqual([child]);
   launcher.allowCleanup = true;
@@ -309,7 +340,10 @@ it("retries a failed lease release after document, process, and runtime cleanup 
   });
   await expect(client.start()).resolves.toMatchObject({
     ok: false,
-    error: { _tag: "HopperProtocolError" },
+    error: {
+      cleanupIncomplete: true,
+      diagnostics: { primary_error: { code: "provider_timeout" } },
+    },
   });
   releaseAllowed = true;
   await expect(client.close()).resolves.toEqual({ ok: true, value: null });
@@ -335,6 +369,7 @@ it("preserves confirmed document shutdown while retrying owned process cleanup",
       processSupervisor: supervisor,
       runtimeRoot,
       shutdownConfirmed: false,
+      externalApplication: undefined,
     } satisfies HopperOwnedResources,
     activeRequest: null,
     retainDocument: false,
@@ -399,6 +434,7 @@ it.each([
       processSupervisor: supervisor,
       runtimeRoot,
       shutdownConfirmed: false,
+      externalApplication: undefined,
     };
     const result = await cleanupHopperSession({
       socket: new Socket(),

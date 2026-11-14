@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { onTestFinished, vi } from "vitest";
+import { onTestFinished } from "vitest";
 import { z } from "zod";
 
 import { ok } from "../../../../src/domain/result.js";
@@ -11,6 +11,7 @@ import type {
 } from "../../../../src/hopper/BridgeLauncher.js";
 import { waitForExit } from "../../../support/process/processFixture.js";
 import { HopperClient } from "../../../../src/hopper/HopperClient.js";
+import { waitFor } from "../../../support/testWait.js";
 
 export const hopperFixturePath = fileURLToPath(
   new URL("../../../fixtures/fakeHopper.mjs", import.meta.url),
@@ -35,6 +36,13 @@ export class HopperFixtureLauncher implements BridgeLauncher {
   constructor(
     readonly tokenOverride?: string,
     readonly diagnosticMode: "quiet" | "noisy" | "noisy_no_socket" = "quiet",
+    readonly healthMode: "ready" | "gated" = "ready",
+    readonly shutdownMode: "acknowledge" | "exit-without-ack" = "acknowledge",
+    readonly inventoryFailure:
+      | "none"
+      | "capability_unavailable"
+      | "bridge_exception" = "none",
+    readonly advertisedRequestBytes?: number,
   ) {}
 
   launch(session: BridgeSession) {
@@ -49,8 +57,13 @@ export class HopperFixtureLauncher implements BridgeLauncher {
         session.socketPath,
         this.tokenOverride ?? session.token,
         session.runId,
-        "acknowledge",
+        this.shutdownMode,
         this.diagnosticMode,
+        this.healthMode,
+        this.inventoryFailure,
+        ...(this.advertisedRequestBytes === undefined
+          ? []
+          : [String(this.advertisedRequestBytes)]),
       ],
       { stdio: ["ignore", "pipe", "pipe", "ipc"] },
     );
@@ -81,19 +94,16 @@ export class HopperFixtureLauncher implements BridgeLauncher {
 
   /** Wait for acknowledgement that the fixture actually received a request. */
   waitForRequest(method: string, gate?: string): Promise<FixtureRequest> {
-    return vi.waitFor(
-      () => {
-        const request = this.requests.find(
-          (value) =>
-            value.method === method &&
-            (gate === undefined || value.params?.gate === gate),
-        );
-        if (request === undefined)
-          throw new Error(`Waiting for Hopper fixture request ${method}`);
-        return request;
-      },
-      { timeout: 10_000 },
-    );
+    return waitFor(() => {
+      const request = this.requests.find(
+        (value) =>
+          value.method === method &&
+          (gate === undefined || value.params?.gate === gate),
+      );
+      if (request === undefined)
+        throw new Error(`Waiting for Hopper fixture request ${method}`);
+      return request;
+    });
   }
 
   /** Release a response held by the fixture's gate parameter. */

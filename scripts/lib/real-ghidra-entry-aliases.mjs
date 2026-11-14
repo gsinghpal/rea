@@ -21,7 +21,6 @@ export async function verifyGhidraEntryAliases({
     new URL("../../tests/conformance/ghidra/entry-aliases.c", import.meta.url),
   );
   const path = join(workspace, "entry-aliases");
-  const prefix = process.platform === "darwin" ? "_" : "";
   try {
     await exec(compiler, ["-O0", "-g", "-fno-inline", source, "-o", path], {
       env,
@@ -29,7 +28,8 @@ export async function verifyGhidraEntryAliases({
     });
     const bytes = await readFile(path);
     await call("close_binary");
-    await call("open_binary", { path, provider_id: "ghidra" });
+    const imported = await call("open_binary", { path, provider_id: "ghidra" });
+    const prefix = imported.format === "mach-o" ? "_" : "";
     const names = await call("list_names");
     const alias = names.find(
       ({ value }) => value === `${prefix}rea_entry_alias`,
@@ -46,8 +46,10 @@ export async function verifyGhidraEntryAliases({
     );
     assert.ok(canonical, "Fixture alias is not at a function entry");
     const xrefsSelectors = [];
+    // CLI xrefs keeps bare hexadecimal selectors as addresses. A Mach-O
+    // primary label such as "dead" is tested below as a procedure name instead.
     for (const value of [
-      canonical.value,
+      `${prefix}rea_alias_target`,
       alias.value,
       `${prefix}rea_xrefs_data`,
       `${prefix}rea_xrefs_unreferenced`,
@@ -71,7 +73,8 @@ export async function verifyGhidraEntryAliases({
         alias.address,
       );
       assert.equal(
-        (await call("analyze_function", { procedure })).procedure.address,
+        (await call("analyze_function", { procedure, detail: "complete" }))
+          .procedure.address,
         alias.address,
       );
       assert.equal(
@@ -84,11 +87,62 @@ export async function verifyGhidraEntryAliases({
       (await call("procedure_info", { procedure: alias.value })).entrypoint,
       alias.address,
     );
+    // Search matches the names exact lookup accepts, as one procedure row
+    // under its primary name.
+    const escaped = alias.value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    for (const query of [
+      { pattern: alias.value },
+      { pattern: `^${escaped}$`, mode: "regex", case_sensitive: true },
+    ]) {
+      assert.deepEqual(
+        (await call("search_procedures", query))
+          .filter(({ address }) => address === alias.address)
+          .map(({ value, matched_aliases }) => ({ value, matched_aliases })),
+        [{ value: canonical.value, matched_aliases: [alias.value] }],
+        `Procedure search missed the entry alias for ${JSON.stringify(query)}`,
+      );
+    }
+    assert.ok(
+      (await call("list_procedures")).every(
+        (row) => row.matched_aliases === undefined,
+      ),
+      "Listings must not report search matches",
+    );
+    const traced = await call("trace_feature", { query: alias.value });
+    assert.ok(
+      traced.matches.some(
+        ({ type, address, matched_aliases }) =>
+          type === "procedure" &&
+          address === alias.address &&
+          matched_aliases?.includes(alias.value) === true,
+      ),
+      "trace_feature missed the procedure its entry alias names",
+    );
     const interior = names.find(
       ({ value }) => value === `${prefix}rea_interior`,
     );
     assert.ok(interior);
     assert.notEqual(interior.address, alias.address);
+    assert.ok(
+      (await call("search_procedures", { pattern: interior.value })).every(
+        ({ address, matched_aliases = [] }) =>
+          address !== interior.address &&
+          !matched_aliases.includes(interior.value),
+      ),
+      "An interior label must not match procedure search",
+    );
+    assert.equal(
+      interior.symbol.type,
+      "label",
+      "Fixture interior control must remain an imported label",
+    );
+    assert.equal(
+      (await call("list_procedures")).some(
+        ({ address }) => address === interior.address,
+      ),
+      false,
+      "Fixture interior control must not be a Ghidra procedure entry",
+    );
     const failure = await reject("procedure_address", {
       procedure: interior.value,
     });
@@ -101,6 +155,15 @@ export async function verifyGhidraEntryAliases({
       await call("procedure_address", { procedure: interior.address }),
       alias.address,
       "Explicit interior addresses keep their existing containment semantics",
+    );
+    const interiorEdit = await call("annotate_native_function", {
+      procedure: interior.address,
+      comment: "Selected by interior address",
+    });
+    assert.equal(interiorEdit.annotations.address, alias.address);
+    assert.equal(
+      interiorEdit.annotations.comment,
+      "Selected by interior address",
     );
     const edited = await call("annotate_native_function", {
       procedure: alias.value,
@@ -153,7 +216,11 @@ export async function verifyGhidraEntryAliases({
           { env, timeout: 240000, maxBuffer: 16 * 1024 * 1024 },
         );
         const evidence = JSON.parse(stdout);
-        assert.deepEqual(evidence.normalized_result, expected);
+        assert.deepEqual(
+          evidence.normalized_result,
+          expected,
+          `CLI xrefs mismatch for ${JSON.stringify(selector)}`,
+        );
         assert.equal(evidence.parameters.address, selector.at(-1));
       }
     }
